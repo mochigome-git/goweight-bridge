@@ -1,0 +1,21 @@
+services:
+  goweight-bridge:
+    build: .
+    container_name: goweight-bridge
+    restart: unless-stopped
+    environment:
+      # Supabase
+      SUPABASE_PROJECT_REF: ${SUPABASE_PROJECT_REF}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY}
+      DATABASE_URL: ${DATABASE_URL}
+      # MQTT
+      MQTT_BROKER: ${MQTT_BROKER}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-goweight-bridge}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_USE_TLS: ${MQTT_USE_TLS:-false}
+      # App
+      TOPIC_PREFIX: ${TOPIC_PREFIX:-gim}
+    network_mode: host  # direct access to EMQX on host
