@@ -2,7 +2,10 @@ package db
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net/url"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -11,30 +14,60 @@ import (
 	"go.uber.org/zap"
 )
 
+// Pool wraps a pgx connection pool with the same reconnect / health-check
+// resilience pattern used by gokafka-raw's DBManager: explicit TLS config,
+// a larger connection pool, a periodic auto-reconnect ping loop, and a
+// graceful shutdown sequence.
 type Pool struct {
-	pool   *pgxpool.Pool
-	logger *zap.Logger
+	pool         *pgxpool.Pool
+	logger       *zap.Logger
+	shutdownChan chan struct{}
+	wg           sync.WaitGroup
+	shutdownOnce sync.Once
 }
 
 func New(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Pool, error) {
-	databaseURL := fmt.Sprintf(
-		"postgresql://%s:%s@%s:%s/%s?sslmode=require&default_query_exec_mode=simple_protocol",
-		cfg.SupabaseDBUser,
-		cfg.SupabaseDBPassword,
-		cfg.SupabaseDBHost,
-		cfg.SupabaseDBPort,
-		cfg.SupabaseDBName,
-	)
+	// cfg.SupabaseDBPassword may be stored pre-URL-encoded (e.g. in ECS, to
+	// dodge issues with raw "@" or other reserved characters elsewhere).
+	// url.UserPassword() percent-encodes whatever it's given when the URL is
+	// serialized, so feeding it an already-encoded password double-encodes it
+	// and breaks auth. Decode first so UserPassword sees the real password.
+	rawPassword, err := url.QueryUnescape(cfg.SupabaseDBPassword)
+	if err != nil {
+		logger.Warn("SupabaseDBPassword did not decode as URL-encoded, using as-is", zap.Error(err))
+		rawPassword = cfg.SupabaseDBPassword
+	}
 
-	poolCfg, err := pgxpool.ParseConfig(databaseURL) // renamed to poolCfg
+	u := &url.URL{
+		Scheme: "postgresql",
+		User:   url.UserPassword(cfg.SupabaseDBUser, rawPassword),
+		Host:   fmt.Sprintf("%s:%s", cfg.SupabaseDBHost, cfg.SupabaseDBPort),
+		Path:   "/" + cfg.SupabaseDBName,
+	}
+
+	poolCfg, err := pgxpool.ParseConfig(u.String())
 	if err != nil {
 		return nil, fmt.Errorf("parse db url: %w", err)
 	}
 
-	poolCfg.MaxConns = 5
-	poolCfg.MinConns = 1
-	poolCfg.MaxConnLifetime = 30 * time.Minute
-	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	// Disable prepared statements — same reasoning as gokafka-raw: avoids
+	// "prepared statement already exists" against Supabase's transaction-mode pooler.
+	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	// Explicit TLS config, matching gokafka-raw's cfg.CreatePostgresTLSConfig().
+	// This project's config package doesn't have that helper yet — if you add
+	// one, swap this line for cfg.CreatePostgresTLSConfig() to share the logic.
+	// Equivalent to the old sslmode=require query param: encrypted, no cert verification.
+	poolCfg.ConnConfig.TLSConfig = &tls.Config{
+		ServerName:         cfg.SupabaseDBHost,
+		InsecureSkipVerify: true,
+	}
+
+	poolCfg.MaxConns = 10
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = time.Hour
+	poolCfg.MaxConnIdleTime = 30 * time.Minute
+	poolCfg.HealthCheckPeriod = time.Minute
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -46,12 +79,86 @@ func New(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*Pool, er
 	}
 
 	logger.Info("Database connected")
-	return &Pool{pool: pool, logger: logger}, nil
+
+	p := &Pool{
+		pool:         pool,
+		logger:       logger,
+		shutdownChan: make(chan struct{}),
+	}
+	p.startAutoReconnect(ctx)
+
+	return p, nil
 }
 
-func (p *Pool) Close() {
-	p.pool.Close()
+// PoolHandle exposes the underlying pgx pool for call sites that need direct access.
+// pgxpool.Pool is already safe for concurrent use on its own, and this field is
+// never reassigned after construction, so no locking is needed here.
+func (p *Pool) PoolHandle() *pgxpool.Pool {
+	return p.pool
 }
+
+// startAutoReconnect periodically pings the DB and logs failures — the same
+// pattern gokafka-raw's DBManager uses. It surfaces auth or connectivity
+// problems within 30s of them starting, instead of only finding out when the
+// next real query happens to fail.
+func (p *Pool) startAutoReconnect(ctx context.Context) {
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-p.shutdownChan:
+				p.logger.Info("Auto-reconnect stopped: shutdown signal received")
+				return
+			case <-ticker.C:
+				if err := p.pool.Ping(ctx); err != nil {
+					p.logger.Error("DB ping failed", zap.Error(err))
+				} else {
+					p.logger.Debug("DB ping successful")
+				}
+			}
+		}
+	}()
+}
+
+// IsShuttingDown reports whether Close has been called.
+func (p *Pool) IsShuttingDown() bool {
+	select {
+	case <-p.shutdownChan:
+		return true
+	default:
+		return false
+	}
+}
+
+// Close gracefully stops the auto-reconnect loop and closes the pool.
+// Kept as "Close" (not "Shutdown") so existing call sites — e.g.
+// `defer database.Close()` in main.go — don't need to change.
+func (p *Pool) Close() {
+	p.shutdownOnce.Do(func() {
+		p.logger.Info("Initiating DB pool graceful shutdown...")
+
+		close(p.shutdownChan)
+		p.wg.Wait()
+
+		if p.pool != nil {
+			p.pool.Close()
+			p.logger.Info("Database connection pool closed")
+		}
+
+		p.logger.Info("DB pool shutdown completed")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Everything below is unchanged business logic, kept as-is from the original
+// db.go. Methods still receive *Pool and use p.pool directly, so nothing here
+// needed to change for the refactor above.
+// ---------------------------------------------------------------------------
 
 // DeviceStatus is the payload from MQTT status topic.
 type DeviceStatus struct {
@@ -207,7 +314,7 @@ func (p *Pool) FetchTenantIDByCode(ctx context.Context, tenantCode string) (stri
 	return id, nil
 }
 
-// Replace InsertModel with this:
+// UpsertModelFromDevice inserts or updates a weight model reported by a device.
 func (p *Pool) UpsertModelFromDevice(ctx context.Context, tenantID, id, name string, lower, standard, upper float64, unit string) error {
 	_, err := p.pool.Exec(ctx, `
         insert into app.weight_models

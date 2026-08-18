@@ -12,7 +12,9 @@ go run "${SCRIPT_DIR}/bump_version.go"
 # --- Load .env ---
 ENV_FILE="${PROJECT_ROOT}/.env"
 if [ -f "$ENV_FILE" ]; then
-  export $(grep -v '^#' "$ENV_FILE" | xargs)
+  set -a
+  source "$ENV_FILE"
+  set +a
 else
   echo "❌ .env file not found at ${ENV_FILE}!"
   exit 1
@@ -29,17 +31,11 @@ REPO_NAME=${ECR_REPO_NAME}
 # Derived tags
 IMAGE_TAG="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO_NAME}:v${VERSION}"
 IMAGE_TAG_LATEST="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${REPO_NAME}:latest"
-DOCKER_IMAGE_VERSION="${DOCKER_TAG}:${VERSION}"
-DOCKER_IMAGE_LATEST="${DOCKER_TAG}:latest"
-
-
 
 echo "📦 Building and pushing image..."
 echo "🔹 Repository: ${REPO_NAME}"
 echo "🔹 Region: ${REGION}"
-echo "🔹 Docker Hub Repo: ${DOCKER_TAG}"
 echo "🔹 Version: v${VERSION}"
-
 
 # --- Ensure ECR repo exists ---
 aws ecr describe-repositories \
@@ -55,18 +51,12 @@ aws ecr get-login-password --region "${REGION}" | docker login \
   --username AWS \
   --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 
-# --- Authenticate Docker ---
-echo "🔐 Logging into Docker Hub..."
-docker login 
-
 # --- Build multi-arch image ---
 echo "🏗️  Building multi-arch image..."
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t "${IMAGE_TAG}" \
   -t "${IMAGE_TAG_LATEST}" \
-  -t "${DOCKER_IMAGE_VERSION}" \
-  -t "${DOCKER_IMAGE_LATEST}" \
   --push \
   "${PROJECT_ROOT}"
 
@@ -79,5 +69,3 @@ echo "✅ Multi-arch image pushed successfully!"
 echo "🖇️ Tags:"
 echo "   - ${IMAGE_TAG}"
 echo "   - ${IMAGE_TAG_LATEST}"
-echo "   • ${DOCKER_IMAGE_VERSION}"
-echo "   • ${DOCKER_IMAGE_LATEST}"
