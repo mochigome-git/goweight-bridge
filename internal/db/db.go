@@ -351,3 +351,22 @@ func (p *Pool) DeleteModel(ctx context.Context, tenantID, id string) error {
 	}
 	return nil
 }
+
+// InsertLot creates a new lot for the machine. production.lot generates the
+// lot itself (defaults/trigger), exactly like the gopub-edge -> gokafka-raw path.
+// Returns the inserted row as JSON so we don't hard-code production.lot's columns.
+func (p *Pool) InsertLot(ctx context.Context, machineID string) ([]byte, error) {
+	var row []byte
+	err := p.pool.QueryRow(ctx, `
+		insert into production.lot as l (machine_id)
+		values ($1)
+		returning to_jsonb(l)`,
+		machineID,
+	).Scan(&row)
+	if err != nil {
+		p.logger.Error("InsertLot failed", zap.String("machine_id", machineID), zap.Error(err))
+		return nil, err
+	}
+	p.logger.Info("Lot inserted", zap.String("machine_id", machineID), zap.ByteString("lot", row))
+	return row, nil
+}
