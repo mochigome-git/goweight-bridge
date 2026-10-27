@@ -113,6 +113,8 @@ func (p *Processor) HandleMessage(client mqtt.Client, msg mqtt.Message) {
 		p.handleModelAck(ctx, tenantCode, deviceID, payload)
 	case "lot/new":
 		p.handleLotNew(ctx, client, tenantCode, deviceID, payload)
+	case "lot/get":
+		p.handleLotGet(ctx, client, tenantCode, deviceID, payload)
 	default:
 		p.logger.Debug("Ignoring unhandled topic type",
 			zap.String("topic", topic),
@@ -250,7 +252,8 @@ type lotAckPayload struct {
 	RequestID string          `json:"request_id"`
 	OK        bool            `json:"ok"`
 	Duplicate bool            `json:"duplicate,omitempty"`
-	Lot       json.RawMessage `json:"lot,omitempty"` // inserted production.lot row
+	Query     bool            `json:"query,omitempty"` // true = answer to lot/get (no lot created)
+	Lot       json.RawMessage `json:"lot,omitempty"`   // inserted production.lot row
 	Error     string          `json:"error,omitempty"`
 }
 
@@ -353,6 +356,52 @@ func (p *Processor) handleLotNew(ctx context.Context, client mqtt.Client,
 		zap.String("device_id", deviceID),
 		zap.String("machine_id", req.MachineID),
 		zap.String("request_id", req.RequestID))
+}
+
+// -----------------------------------------------------------------------
+// lot/get - HMI asks for the machine's current lot (boot / reconnect)
+// {"request_id":"uuid","machine_id":"uuid"}
+//
+// Reply on the same {tenant}/{device}/lot/ack topic with query=true.
+// ok=true and no "lot" field means the machine has no active lot.
+// -----------------------------------------------------------------------
+
+type lotGetPayload struct {
+	RequestID string `json:"request_id"`
+	MachineID string `json:"machine_id"`
+}
+
+func (p *Processor) handleLotGet(ctx context.Context, client mqtt.Client,
+	tenantCode, deviceID string, payload []byte) {
+
+	var req lotGetPayload
+	if err := json.Unmarshal(payload, &req); err != nil {
+		p.logger.Warn("Bad lot/get payload", zap.String("device_id", deviceID), zap.Error(err))
+		return
+	}
+
+	ack := lotAckPayload{RequestID: req.RequestID, Query: true}
+	defer func() { p.publishLotAck(client, tenantCode, deviceID, ack) }()
+
+	if !uuidRe.MatchString(req.MachineID) {
+		ack.Error = "invalid machine_id"
+		return
+	}
+
+	dbCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	row, err := p.db.GetActiveLot(dbCtx, req.MachineID)
+	if err != nil {
+		ack.Error = "db error"
+		return
+	}
+
+	ack.OK = true
+	ack.Lot = row // nil -> omitted -> "no active lot"
+	p.logger.Info("lot/get handled",
+		zap.String("device_id", deviceID),
+		zap.String("machine_id", req.MachineID),
+		zap.Bool("found", row != nil))
 }
 
 // Publishing from inside a Paho message handler must not block on the token

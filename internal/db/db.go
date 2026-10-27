@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/url"
 	"sync"
@@ -368,5 +369,28 @@ func (p *Pool) InsertLot(ctx context.Context, machineID string) ([]byte, error) 
 		return nil, err
 	}
 	p.logger.Info("Lot inserted", zap.String("machine_id", machineID), zap.ByteString("lot", row))
+	return row, nil
+}
+
+// GetActiveLot returns the machine's newest active lot as JSON, or (nil, nil)
+// when the machine has no active lot. Used by the HMI on boot/reconnect so the
+// screen shows the right lot even if it was started elsewhere (PLC, dashboard).
+func (p *Pool) GetActiveLot(ctx context.Context, machineID string) ([]byte, error) {
+	var row []byte
+	err := p.pool.QueryRow(ctx, `
+		select to_jsonb(l)
+		from production.lot l
+		where l.machine_id = $1 and l.status = 'active'
+		order by l.created_at desc
+		limit 1`,
+		machineID,
+	).Scan(&row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		p.logger.Error("GetActiveLot failed", zap.String("machine_id", machineID), zap.Error(err))
+		return nil, err
+	}
 	return row, nil
 }

@@ -56,6 +56,7 @@ func main() {
 			"+/+/status":    1,
 			"+/+/model/ack": 1,
 			"+/+/lot/new":   1,
+			"+/+/lot/get":   1,
 			"+/models/push": 1,
 		}
 		token := c.SubscribeMultiple(topics, func(client mqtt.Client, msg mqtt.Message) {
@@ -68,7 +69,7 @@ func main() {
 			logger.Error("MQTT subscribe failed", zap.Error(token.Error()))
 		} else {
 			logger.Info("Subscribed to device topics",
-				zap.Strings("topics", []string{"+/+/status", "+/+/model/ack", "+/+/lot/new", "+/models/push"}),
+				zap.Strings("topics", []string{"+/+/status", "+/+/model/ack", "+/+/lot/new", "+/+/lot/get", "+/models/push"}),
 			)
 		}
 	})
